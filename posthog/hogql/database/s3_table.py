@@ -12,6 +12,24 @@ from posthog.hogql.escape_sql import escape_hogql_identifier
 
 from posthog.clickhouse.client.escape import substitute_params
 
+# Extensions ClickHouse interprets as compression on s3() reads. When one of
+# these precedes a self-compressed format like Parquet/ORC (e.g. AWS RDS
+# snapshot exports use `.gz.parquet`), ClickHouse will decompress the file
+# before parsing, corrupting the read. We must explicitly pass `'none'` to
+# disable that.
+_COMPRESSION_AUTO_DETECT_EXTENSIONS = frozenset({".gz", ".br", ".xz", ".zstd", ".lz4", ".bz2", ".deflate"})
+_SELF_COMPRESSED_FORMATS = frozenset({"parquet", "orc"})
+
+
+def _needs_explicit_no_compression(url: str, format: str) -> bool:
+    if format.lower() not in _SELF_COMPRESSED_FORMATS:
+        return False
+    path = url.split("?", 1)[0].rstrip("/")
+    suffixes = PurePosixPath(path).suffixes
+    if len(suffixes) < 2:
+        return False
+    return suffixes[-2].lower() in _COMPRESSION_AUTO_DETECT_EXTENSIONS
+
 
 def build_function_call(
     url: str,
@@ -159,6 +177,13 @@ def build_function_call(
 
     if structure:
         expr += f", {escaped_structure}"
+
+    if _needs_explicit_no_compression(url, format):
+        # ClickHouse `s3()` requires structure to come before compression, so
+        # default to 'auto' when the caller didn't supply one.
+        if not structure:
+            expr += ", 'auto'"
+        expr += ", 'none'"
 
     return return_expr(expr)
 
