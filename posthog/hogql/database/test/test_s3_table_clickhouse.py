@@ -10,7 +10,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from botocore.config import Config
 
+from posthog.hogql.database.s3_table import build_function_call
+
 from posthog.clickhouse.client import sync_execute
+
+from products.data_warehouse.backend.models.table import DataWarehouseTable
 
 MINIO_ENDPOINT = "http://localhost:19000"
 MINIO_CH_ENDPOINT = "http://objectstorage:19000"
@@ -156,3 +160,59 @@ class TestS3ParquetTimezoneConversion(ClickhouseTestMixin, BaseTest):
                 assert row[1] is not None, f"MergeTree: toTimeZone NULL for id={row[0]}"
         finally:
             sync_execute(f"DROP TABLE IF EXISTS {table_name}")
+
+
+class TestS3GzParquetCompression(ClickhouseTestMixin, BaseTest):
+    """End-to-end regression for #42558.
+
+    AWS RDS' "export snapshot to S3" produces files with `.gz.parquet`
+    extensions even though they're already-Parquet-compressed. ClickHouse
+    auto-decompresses based on the `.gz` portion of the extension and
+    surfaces a generic "Could not get columns" error.
+
+    These tests upload a real Parquet file with that suspicious extension
+    and read it back through `build_function_call`, exercising the
+    `compression='none'` override end-to-end.
+    """
+
+    plain_url: str
+    gz_parquet_url: str
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        table = pa.table(
+            {
+                "id": pa.array([1, 2, 3], type=pa.int64()),
+                "name": pa.array(["alpha", "beta", "gamma"], type=pa.string()),
+            }
+        )
+        # Same Parquet bytes uploaded under both a plain `.parquet` key and a
+        # `.gz.parquet` key — only the extension differs. The plain upload is
+        # a control to confirm Parquet reads work in this test setup.
+        cls.plain_url = _upload_parquet_to_minio(table, "compression_e2e_plain.parquet")
+        cls.gz_parquet_url = _upload_parquet_to_minio(table, "compression_e2e_snapshot.gz.parquet")
+
+    def _query_via_build_function_call(self, url: str) -> list:
+        s3_expr = build_function_call(
+            url,
+            DataWarehouseTable.TableFormat.Parquet,
+            None,
+            MINIO_ACCESS_KEY,
+            MINIO_SECRET_KEY,
+            "id Int64, name String",
+            None,
+        )
+        return sync_execute(f"SELECT id, name FROM {s3_expr} ORDER BY id")
+
+    def test_plain_parquet_reads_correctly(self):
+        # Sanity: the same Parquet bytes under a plain extension are readable.
+        rows = self._query_via_build_function_call(self.plain_url)
+        assert rows == [(1, "alpha"), (2, "beta"), (3, "gamma")]
+
+    def test_gz_parquet_reads_correctly_with_compression_none_override(self):
+        # The fix: with `compression='none'` injected by build_function_call,
+        # ClickHouse must skip its `.gz`-driven decompression and parse the
+        # bytes as plain Parquet. Without the fix, ClickHouse would error.
+        rows = self._query_via_build_function_call(self.gz_parquet_url)
+        assert rows == [(1, "alpha"), (2, "beta"), (3, "gamma")]
