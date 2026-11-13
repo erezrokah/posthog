@@ -194,7 +194,37 @@ pub async fn otel_handler(
 
     let received_at = Utc::now();
     let request_fallback_distinct_id = identity::request_fallback_distinct_id();
-    let mut span_events = fan_out::expand_into_events(&request, &request_fallback_distinct_id);
+    let mut span_events = match fan_out::expand_into_events(&request, &request_fallback_distinct_id)
+    {
+        Ok(events) => events,
+        Err(fan_out::ExpandError::TooManyAiSpans(span_count)) => {
+            Span::current().record("span_count", span_count);
+            let dropped_span_count = raw_span_count.saturating_sub(span_count);
+            if dropped_span_count > 0 {
+                counter!("capture_ai_otel_spans_filtered").increment(dropped_span_count as u64);
+            }
+            let err = CaptureError::RequestParsingError(format!(
+                "Too many AI spans: {span_count} exceeds limit of {MAX_SPANS_PER_REQUEST}"
+            ));
+            report_internal_error_metrics(err.to_metric_tag(), "otel_validation");
+            emit_span_cap_warning(
+                state.ingestion_warning_emitter.as_deref(),
+                &otel_request_context(token, OTEL_PATH, Some(&request)),
+                SpanCapStage::Ai,
+                span_count,
+                MAX_SPANS_PER_REQUEST,
+            );
+            return Err(err.into_response());
+        }
+        Err(fan_out::ExpandError::ResourceAttributesTooLarge(bytes)) => {
+            let err = CaptureError::EventTooBig(format!(
+                "Resource attributes expand to {bytes} bytes across AI spans, exceeding limit of {}",
+                fan_out::MAX_EXPANDED_RESOURCE_BYTES
+            ));
+            report_internal_error_metrics(err.to_metric_tag(), "otel_validation");
+            return Err(err.into_response());
+        }
+    };
     provenance::apply(
         &mut span_events,
         gateway_provenance,
@@ -224,20 +254,6 @@ pub async fn otel_handler(
         );
         counter!("capture_ai_otel_requests_success").increment(1);
         return Ok(Json(json!({})));
-    }
-    if span_count > MAX_SPANS_PER_REQUEST {
-        let err = CaptureError::RequestParsingError(format!(
-            "Too many AI spans: {span_count} exceeds limit of {MAX_SPANS_PER_REQUEST}"
-        ));
-        report_internal_error_metrics(err.to_metric_tag(), "otel_validation");
-        emit_span_cap_warning(
-            state.ingestion_warning_emitter.as_deref(),
-            &otel_request_context(token, OTEL_PATH, Some(&request)),
-            SpanCapStage::Ai,
-            span_count,
-            MAX_SPANS_PER_REQUEST,
-        );
-        return Err(err.into_response());
     }
 
     counter!("capture_ai_otel_spans_accepted").increment(span_count as u64);

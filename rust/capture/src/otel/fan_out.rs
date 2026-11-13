@@ -115,6 +115,110 @@ fn nanos_to_datetime(nanos: u64) -> Option<DateTime<Utc>> {
     Utc.timestamp_opt(secs, nsecs).single()
 }
 
+/// Upper bound on resource-attribute bytes copied across all span events of
+/// one request. Every AI span gets its own copy of the resource attributes, so
+/// a single large attribute multiplies by the span count before any per-event
+/// size check can see it.
+pub(super) const MAX_EXPANDED_RESOURCE_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ExpandError {
+    TooManyAiSpans(usize),
+    ResourceAttributesTooLarge(usize),
+}
+
+fn json_string_size(s: &str) -> usize {
+    2 + s
+        .bytes()
+        .map(|b| match b {
+            b'"' | b'\\' => 2,
+            0x00..=0x1f => 6,
+            _ => 1,
+        })
+        .sum::<usize>()
+}
+
+/// Approximates the serialized JSON size of an attribute value without
+/// building it, so the expansion budget can be checked before any copying.
+fn estimated_json_size(value: &any_value::Value) -> usize {
+    match value {
+        any_value::Value::StringValue(s) => json_string_size(s),
+        any_value::Value::BoolValue(_) => 5,
+        any_value::Value::IntValue(_) | any_value::Value::DoubleValue(_) => 24,
+        any_value::Value::BytesValue(bytes) => bytes.len() * 2 + 2,
+        any_value::Value::ArrayValue(arr) => {
+            2 + arr
+                .values
+                .iter()
+                .filter_map(|v| v.value.as_ref())
+                .map(|v| estimated_json_size(v) + 1)
+                .sum::<usize>()
+        }
+        any_value::Value::KvlistValue(kvlist) => 2 + estimated_attributes_size(&kvlist.values),
+    }
+}
+
+fn estimated_attribute_size(kv: &KeyValue) -> Option<usize> {
+    kv.value
+        .as_ref()
+        .and_then(|v| v.value.as_ref())
+        .map(|v| json_string_size(&kv.key) + 2 + estimated_json_size(v))
+}
+
+fn estimated_attributes_size(attrs: &[KeyValue]) -> usize {
+    attrs.iter().filter_map(estimated_attribute_size).sum()
+}
+
+fn estimated_resource_size(attrs: &[KeyValue]) -> usize {
+    attrs
+        .iter()
+        .filter(|kv| {
+            !NOISY_RESOURCE_PREFIXES
+                .iter()
+                .any(|prefix| kv.key.starts_with(prefix))
+        })
+        .filter_map(estimated_attribute_size)
+        .sum()
+}
+
+/// Checks the AI span cap and the resource-attribute budget before any span is
+/// expanded, so a rejected request never pays for building its events.
+fn check_expansion_limits(request: &ExportTraceServiceRequest) -> Result<(), ExpandError> {
+    let mut ai_span_count = 0;
+    let mut expanded_resource_bytes: usize = 0;
+
+    for rs in &request.resource_spans {
+        let resource_ai_spans = rs
+            .scope_spans
+            .iter()
+            .flat_map(|ss| &ss.spans)
+            .filter(|span| providers::get_provider_raw(&span.attributes).is_some())
+            .count();
+        if resource_ai_spans == 0 {
+            continue;
+        }
+        ai_span_count += resource_ai_spans;
+
+        let resource_size = rs
+            .resource
+            .as_ref()
+            .map(|r| estimated_resource_size(&r.attributes))
+            .unwrap_or_default();
+        expanded_resource_bytes =
+            expanded_resource_bytes.saturating_add(resource_size.saturating_mul(resource_ai_spans));
+    }
+
+    if ai_span_count > super::MAX_SPANS_PER_REQUEST {
+        return Err(ExpandError::TooManyAiSpans(ai_span_count));
+    }
+    if expanded_resource_bytes > MAX_EXPANDED_RESOURCE_BYTES {
+        return Err(ExpandError::ResourceAttributesTooLarge(
+            expanded_resource_bytes,
+        ));
+    }
+    Ok(())
+}
+
 /// Convert OTLP spans into [`SpanEvent`]s. `request_fallback_distinct_id` is
 /// used only when neither the span nor its enclosing resource carries a
 /// distinct_id attribute and the span has no session id or valid trace id to
@@ -123,7 +227,9 @@ fn nanos_to_datetime(nanos: u64) -> Option<DateTime<Utc>> {
 pub fn expand_into_events(
     request: &ExportTraceServiceRequest,
     request_fallback_distinct_id: &str,
-) -> Vec<SpanEvent> {
+) -> Result<Vec<SpanEvent>, ExpandError> {
+    check_expansion_limits(request)?;
+
     let total_spans: usize = request
         .resource_spans
         .iter()
@@ -211,7 +317,7 @@ pub fn expand_into_events(
         }
     }
 
-    events
+    Ok(events)
 }
 
 #[cfg(test)]
@@ -334,7 +440,7 @@ mod tests {
             }],
         };
 
-        let events = expand_into_events(&request, "user-1");
+        let events = expand_into_events(&request, "user-1").unwrap();
         assert_eq!(events.len(), 1);
 
         let event = &events[0];
@@ -379,7 +485,7 @@ mod tests {
             }],
         };
 
-        let events = expand_into_events(&request, "user-1");
+        let events = expand_into_events(&request, "user-1").unwrap();
         assert!(events.is_empty());
     }
 
@@ -429,7 +535,7 @@ mod tests {
             }],
         };
 
-        let events = expand_into_events(&request, "user");
+        let events = expand_into_events(&request, "user").unwrap();
         let props = events[0].properties.as_object().unwrap();
         assert_eq!(props["service.name"], "my-svc");
         assert!(!props.contains_key("host.name"));
@@ -463,7 +569,7 @@ mod tests {
             }],
         };
 
-        let events = expand_into_events(&request, "user");
+        let events = expand_into_events(&request, "user").unwrap();
         let props = events[0].properties.as_object().unwrap();
         assert_eq!(props["$ai_parent_id"], "0102030405060708");
     }
@@ -493,7 +599,7 @@ mod tests {
             }],
         };
 
-        let events = expand_into_events(&request, "user");
+        let events = expand_into_events(&request, "user").unwrap();
         let props = events[0].properties.as_object().unwrap();
         assert!(!props.contains_key("$ai_parent_id"));
     }
@@ -503,7 +609,7 @@ mod tests {
         let request = ExportTraceServiceRequest {
             resource_spans: vec![],
         };
-        let events = expand_into_events(&request, "user");
+        let events = expand_into_events(&request, "user").unwrap();
         assert!(events.is_empty());
     }
 
@@ -543,7 +649,7 @@ mod tests {
                 schema_url: String::new(),
             }],
         };
-        let events = expand_into_events(&request, "fallback");
+        let events = expand_into_events(&request, "fallback").unwrap();
         assert_eq!(events[0].distinct_id, "span-user");
     }
 
@@ -597,7 +703,7 @@ mod tests {
                 schema_url: String::new(),
             }],
         };
-        let events = expand_into_events(&request, "fallback");
+        let events = expand_into_events(&request, "fallback").unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].distinct_id, "user-a");
         assert_eq!(events[1].distinct_id, "user-b");
@@ -633,7 +739,7 @@ mod tests {
                 schema_url: String::new(),
             }],
         };
-        let events = expand_into_events(&request, "fallback");
+        let events = expand_into_events(&request, "fallback").unwrap();
         assert_eq!(events[0].distinct_id, "resource-user");
     }
 
@@ -661,7 +767,7 @@ mod tests {
                 schema_url: String::new(),
             }],
         };
-        let events = expand_into_events(&request, "fallback-id");
+        let events = expand_into_events(&request, "fallback-id").unwrap();
         assert_eq!(events[0].distinct_id, "fallback-id");
     }
 
@@ -689,8 +795,8 @@ mod tests {
                 schema_url: String::new(),
             }],
         };
-        let first = expand_into_events(&request, "first-request");
-        let second = expand_into_events(&request, "second-request");
+        let first = expand_into_events(&request, "first-request").unwrap();
+        let second = expand_into_events(&request, "second-request").unwrap();
         assert_eq!(first[0].distinct_id, second[0].distinct_id);
         assert_ne!(first[0].distinct_id, "first-request");
     }
@@ -752,10 +858,124 @@ mod tests {
             resource_attrs.iter().map(to_kv).collect(),
             span_attrs.iter().map(to_kv).collect(),
         );
-        let events = expand_into_events(&request, "user");
+        let events = expand_into_events(&request, "user").unwrap();
         let props = events[0].properties.as_object().unwrap();
         assert_eq!(props["$geoip_disable"], Value::Bool(expected_geoip_disable));
         // Alias must always be consumed so it doesn't leak as a duplicate property.
         assert!(!props.contains_key("posthog.geoip_disable"));
+    }
+
+    fn make_request_with_spans(
+        resource_attrs: Vec<KeyValue>,
+        ai_spans: usize,
+        non_ai_spans: usize,
+    ) -> ExportTraceServiceRequest {
+        let ai = (0..ai_spans).map(|_| {
+            make_span(
+                vec![1; 16],
+                vec![2; 8],
+                vec![],
+                0,
+                0,
+                "",
+                vec![make_kv(
+                    "gen_ai.request.model",
+                    any_value::Value::StringValue("gpt-4".to_string()),
+                )],
+            )
+        });
+        let non_ai = (0..non_ai_spans).map(|_| {
+            make_span(
+                vec![1; 16],
+                vec![2; 8],
+                vec![],
+                0,
+                0,
+                "",
+                vec![make_kv(
+                    "http.method",
+                    any_value::Value::StringValue("GET".to_string()),
+                )],
+            )
+        });
+        ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: resource_attrs,
+                    dropped_attributes_count: 0,
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: ai.chain(non_ai).collect(),
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+    }
+
+    #[rstest]
+    #[case::at_limit(100, 0, Ok(100))]
+    #[case::non_ai_spans_not_counted(100, 500, Ok(100))]
+    #[case::one_over_limit(101, 0, Err(ExpandError::TooManyAiSpans(101)))]
+    #[case::reports_full_count(1000, 0, Err(ExpandError::TooManyAiSpans(1000)))]
+    fn test_ai_span_cap_enforced_before_expansion(
+        #[case] ai_spans: usize,
+        #[case] non_ai_spans: usize,
+        #[case] expected: Result<usize, ExpandError>,
+    ) {
+        let request = make_request_with_spans(vec![], ai_spans, non_ai_spans);
+        let result = expand_into_events(&request, "user").map(|events| events.len());
+        assert_eq!(result, expected);
+    }
+
+    const LARGE_ATTR_BYTES: usize = 100 * 1024;
+
+    #[rstest]
+    // Hex encoding doubles the bytes: 50 copies of ~200 KiB stay under the budget.
+    #[case::under_budget("blob", 50, true)]
+    #[case::over_budget("blob", 100, false)]
+    // Noisy resource attributes are filtered out, so they are never copied.
+    #[case::noisy_prefix_not_counted("host.blob", 100, true)]
+    fn test_resource_attribute_budget(
+        #[case] key: &str,
+        #[case] ai_spans: usize,
+        #[case] accepted: bool,
+    ) {
+        let request = make_request_with_spans(
+            vec![make_kv(
+                key,
+                any_value::Value::BytesValue(vec![0xab; LARGE_ATTR_BYTES]),
+            )],
+            ai_spans,
+            0,
+        );
+        match expand_into_events(&request, "user") {
+            Ok(events) => {
+                assert!(accepted, "expected the request to exceed the budget");
+                assert_eq!(events.len(), ai_spans);
+            }
+            Err(ExpandError::ResourceAttributesTooLarge(bytes)) => {
+                assert!(!accepted, "expected the request to fit the budget");
+                assert!(bytes > MAX_EXPANDED_RESOURCE_BYTES);
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_estimated_size_bounds_serialized_resource_attributes() {
+        let attrs = vec![
+            make_kv("service.name", any_value::Value::StringValue("svc".into())),
+            make_kv(
+                "escaped\"key",
+                any_value::Value::StringValue("line\n\u{1}\"quoted\"\\".into()),
+            ),
+            make_kv("blob", any_value::Value::BytesValue(vec![0xcd; 4096])),
+            make_kv("flag", any_value::Value::BoolValue(true)),
+            make_kv("count", any_value::Value::IntValue(42)),
+        ];
+        let serialized = serde_json::to_string(&filter_resource_attributes(&attrs)).unwrap();
+        assert!(estimated_resource_size(&attrs) >= serialized.len());
     }
 }
